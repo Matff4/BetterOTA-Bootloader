@@ -1,3 +1,5 @@
-int main() {
-// write your code here
+#include <stdio.h>
+
+void app_main(void) {
+    printf("Hello from the main application!\n");
 }
