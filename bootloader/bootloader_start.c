@@ -33,7 +33,7 @@ void __attribute__((noreturn)) call_start_cpu0(void)
     }
 
     // 0.1 LOG CUSTOM INFO
-    ESP_LOGE("CUSTOM BL", "THIS IS EMPTY CUSTOM BOOTLOADER");
+    ESP_LOGE("CUSTOM BL", "THIS IS EMPTY CUSTOM BOOT LOAD ER");
 
     // 1. Hardware initialization
     if (bootloader_init() != ESP_OK) {
