@@ -4,154 +4,201 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <stdbool.h>
-#include <stdint.h>
 #include "esp_log.h"
 #include "esp_rom_sys.h"
-#include "esp_rom_crc.h"
-#include "esp_rom_spiflash.h" // The key: direct access to ROM flash functions
 #include "bootloader_init.h"
 #include "bootloader_utility.h"
 #include "bootloader_common.h"
 #include "bootloader_hooks.h"
+#include "soc/gpio_struct.h"
 
-static const char *TAG = "boot";
-
-// --- Self-Contained OTA Logic using ROM Functions ---
-
-// Minimal partition entry structure to find otadata
-typedef struct {
-    uint16_t magic;
-    uint8_t type;
-    uint8_t subtype;
-    uint32_t offset;
-    uint32_t size;
-    uint8_t label[16];
-    uint32_t flags;
-} minimal_partition_entry_t;
-
-// Minimal otadata entry structure (older version compatible)
-typedef struct {
-    uint32_t ota_seq;
-    uint8_t ota_state;
-    uint8_t reserved[3];
-    uint32_t crc;
-} minimal_ota_select_entry_t;
-
-// Find the flash offset of the otadata partition by manually scanning the partition table.
-static uint32_t find_otadata_offset(void)
-{
-    const uint32_t partition_table_addr = 0x8000; // ESP_PARTITION_TABLE_OFFSET
-    const uint8_t ota_data_subtype = 0x00;       // ESP_PARTITION_SUBTYPE_DATA_OTA
-    minimal_partition_entry_t entry;
-
-    for (int i = 0; i < 16; ++i) { // Scan a reasonable number of entries
-        uint32_t read_addr = partition_table_addr + i * sizeof(minimal_partition_entry_t);
-        // --- FIX: Cast struct pointer to uint32_t* ---
-        esp_rom_spiflash_read(read_addr, (uint32_t*)&entry, sizeof(entry));
-
-        if (entry.magic == 0x50AA && entry.type == 0x01 && entry.subtype == ota_data_subtype) {
-            return entry.offset;
-        }
-    }
-    return 0; // Not found
-}
-
-// The core logic to set the next boot partition to OTA0.
-static void set_next_boot_to_recovery(void)
-{
-    uint32_t otadata_addr = find_otadata_offset();
-    if (otadata_addr == 0) {
-        ESP_LOGE(TAG, "otadata partition not found. Cannot set next boot.");
-        return;
-    }
-
-    // Read the two ota_select entries
-    minimal_ota_select_entry_t entries[2];
-    // --- FIX: Cast struct pointer to uint32_t* ---
-    esp_rom_spiflash_read(otadata_addr, (uint32_t*)entries, sizeof(entries));
-
-    // Basic validation and selection of which entry to update
-    bool entry0_valid = (entries[0].crc == esp_rom_crc32_le(0, (uint8_t*)&entries[0], sizeof(minimal_ota_select_entry_t) - 4));
-    bool entry1_valid = (entries[1].crc == esp_rom_crc32_le(0, (uint8_t*)&entries[1], sizeof(minimal_ota_select_entry_t) - 4));
-
-    uint8_t update_idx = 0;
-    if (entry0_valid && entry1_valid) {
-        update_idx = (entries[0].ota_seq > entries[1].ota_seq) ? 1 : 0;
-    } else if (entry0_valid) {
-        update_idx = 1;
-    } else {
-        update_idx = 0;
-    }
-
-    // Prepare the new entry to boot OTA0
-    minimal_ota_select_entry_t new_entry;
-    uint32_t last_seq = entries[update_idx == 0 ? 1 : 0].ota_seq;
-    new_entry.ota_seq = last_seq + 1;
-    new_entry.ota_state = 0; // ESP_OTA_IMG_NEW / PENDING_VERIFY
-    new_entry.crc = esp_rom_crc32_le(0, (uint8_t*)&new_entry, sizeof(minimal_ota_select_entry_t) - 4);
-
-    // Write to flash using ROM functions
-    uint32_t write_addr = otadata_addr + update_idx * sizeof(minimal_ota_select_entry_t);
-    esp_rom_spiflash_erase_sector(write_addr / 4096);
-    // --- FIX: Cast struct pointer to const uint32_t* ---
-    esp_rom_spiflash_write(write_addr, (const uint32_t*)&new_entry, sizeof(new_entry));
-    ESP_LOGI(TAG, "Next boot set to OTA0 via ROM functions.");
-}
-
-
-// --- Standard Bootloader Flow ---
+static const char *TAG = "BetterOTA";
 
 static int select_partition_number(bootloader_state_t *bs);
 static int selected_boot_partition(const bootloader_state_t *bs);
 
+// --- Button Configuration ---
+static const uint8_t BOOT_BUTTON_GPIO = 13;
+static const uintptr_t IO_MUX_MTCK_REG_ADDR = 0x3FF49038U;
+static volatile uint32_t * const IO_MUX_MTCK_REG = (volatile uint32_t *)IO_MUX_MTCK_REG_ADDR;
+
+
+/**
+ * @brief Initializes the boot button on GPIO 13.
+ */
+static void button_init(void)
+{
+    uint32_t r = *IO_MUX_MTCK_REG;
+    r &= ~(0x7U << 12);           // clear MCU_SEL
+    r |= (2U << 12);              // set MCU_SEL = 2 (GPIO)
+    r &= ~(1U << 7);              // clear pulldown
+    r |= (1U << 8);               // set pullup
+    r |= (1U << 9);               // enable input (FUN_IE)
+    *IO_MUX_MTCK_REG = r;
+}
+
+/**
+ * @brief Reads button state using the reliable "drive test" method.
+ *
+ * This function forces the pin high momentarily, which correctly initializes
+ * it, allowing for a reliable read. It then safely returns the pin to
+ * a high-impedance input state with the pull-up re-enabled.
+ *
+ * @return int 0 if the button is pressed (LOW), 1 if not pressed (HIGH).
+ */
+static bool button_pressed(void)
+{
+    button_init();          // Initial setup
+
+    GPIO.enable_w1ts = (1u << BOOT_BUTTON_GPIO);    // Enable output for the pin
+    GPIO.out_w1ts = (1u << BOOT_BUTTON_GPIO);       // Set the output level to high
+
+    const bool pressed = !(GPIO.in & (1u << BOOT_BUTTON_GPIO));  // Read the pin state while it's being driven
+
+    GPIO.enable_w1tc = (1u << BOOT_BUTTON_GPIO);    // Immediately disable output, returning pin to a safe high-impedance state
+    GPIO.out_w1tc = (1u << BOOT_BUTTON_GPIO);       // Clear the output register just in case
+
+    button_init();          // Re-initialize the pin to ensure the pull-up is active again
+
+    return pressed;
+}
+
+
+/*
+ * We arrive here after the ROM bootloader finished loading this second stage bootloader from flash.
+ * The hardware is mostly uninitialized, flash cache is down and the app CPU is in reset.
+ * We do have a stack, so we can do the initialization in C.
+ */
 void __attribute__((noreturn)) call_start_cpu0(void)
 {
+    // (0. Call the before-init hook, if available)
     if (bootloader_before_init) {
         bootloader_before_init();
     }
+
+    // 1. Hardware initialization
     if (bootloader_init() != ESP_OK) {
         bootloader_reset();
     }
+
+    // (1.1 Call the after-init hook, if available)
     if (bootloader_after_init) {
         bootloader_after_init();
     }
 
+#ifdef CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP
+    // If this boot is a wake up from the deep sleep then go to the short way,
+    // try to load the application which worked before deep sleep.
+    // It skips a lot of checks due to it was done before (while first boot).
+    bootloader_utility_load_boot_image_from_deep_sleep();
+    // If it is not successful try to load an application as usual.
+#endif
+
+    // 2. Select the number of boot partition
     bootloader_state_t bs = {0};
     int boot_index = select_partition_number(&bs);
     if (boot_index == INVALID_INDEX) {
         bootloader_reset();
     }
 
+    // 2.1 Load the TEE image
+#if CONFIG_SECURE_ENABLE_TEE
+    bootloader_utility_load_tee_image(&bs);
+#endif
+
+    ESP_LOGI(TAG, "--- Checking button on GPIO %d ---", BOOT_BUTTON_GPIO);
+    bool button = button_pressed();
+    ESP_LOGI(TAG, "Button state is: %d (%s)", button, button ? "PRESSED" : "NOT PRESSED");
+
+    // --- Select OTA partition based on button ---
+    if (button) {
+        // Button pressed → OTA_0
+        boot_index = 0;   // OTA_0 partition index
+    } else {
+        // Button not pressed → OTA_1
+        boot_index = 1;   // OTA_1 partition index
+    }
+
+
+    // 3. Load the app image for booting
+    //while (true) {}
     bootloader_utility_load_boot_image(&bs, boot_index);
 }
 
+// Select the number of boot partition
 static int select_partition_number(bootloader_state_t *bs)
 {
+    // 1. Load partition table
     if (!bootloader_utility_load_partition_table(bs)) {
         ESP_LOGE(TAG, "load partition table error!");
         return INVALID_INDEX;
     }
+
+    // 2. Select the number of boot partition
     return selected_boot_partition(bs);
 }
 
+/*
+ * Selects a boot partition.
+ * The conditions for switching to another firmware are checked.
+ */
 static int selected_boot_partition(const bootloader_state_t *bs)
 {
-    // First, let the standard logic determine which partition to boot NOW.
     int boot_index = bootloader_utility_get_selected_boot_partition(bs);
     if (boot_index == INVALID_INDEX) {
-        return boot_index;
+        return boot_index; // Unrecoverable failure (not due to corrupt ota data or bad partition contents)
     }
-
-    // Now, inject our logic to change what happens on the NEXT boot.
     if (esp_rom_get_reset_reason(0) != RESET_REASON_CORE_DEEP_SLEEP) {
-        set_next_boot_to_recovery();
+        // Factory firmware.
+#ifdef CONFIG_BOOTLOADER_FACTORY_RESET
+        bool reset_level = false;
+#if CONFIG_BOOTLOADER_FACTORY_RESET_PIN_HIGH
+        reset_level = true;
+#endif
+        if (bootloader_common_check_long_hold_gpio_level(CONFIG_BOOTLOADER_NUM_PIN_FACTORY_RESET, CONFIG_BOOTLOADER_HOLD_TIME_GPIO, reset_level) == GPIO_LONG_HOLD) {
+            ESP_LOGI(TAG, "Detect a condition of the factory reset");
+            bool ota_data_erase = false;
+#ifdef CONFIG_BOOTLOADER_OTA_DATA_ERASE
+            ota_data_erase = true;
+#endif
+            const char *list_erase = CONFIG_BOOTLOADER_DATA_FACTORY_RESET;
+            ESP_LOGI(TAG, "Data partitions to erase: %s", list_erase);
+            if (bootloader_common_erase_part_type_data(list_erase, ota_data_erase) == false) {
+                ESP_LOGE(TAG, "Not all partitions were erased");
+            }
+#ifdef CONFIG_BOOTLOADER_RESERVE_RTC_MEM
+            bootloader_common_set_rtc_retain_mem_factory_reset_state();
+#endif
+            return bootloader_utility_get_selected_boot_partition(bs);
+        }
+#endif // CONFIG_BOOTLOADER_FACTORY_RESET
+        // TEST firmware.
+#ifdef CONFIG_BOOTLOADER_APP_TEST
+        bool app_test_level = false;
+#if CONFIG_BOOTLOADER_APP_TEST_PIN_HIGH
+        app_test_level = true;
+#endif
+        if (bootloader_common_check_long_hold_gpio_level(CONFIG_BOOTLOADER_NUM_PIN_APP_TEST, CONFIG_BOOTLOADER_HOLD_TIME_GPIO, app_test_level) == GPIO_LONG_HOLD) {
+            ESP_LOGI(TAG, "Detect a boot condition of the test firmware");
+            if (bs->test.offset != 0) {
+                boot_index = TEST_APP_INDEX;
+                return boot_index;
+            } else {
+                ESP_LOGE(TAG, "Test firmware is not found in partition table");
+                return INVALID_INDEX;
+            }
+        }
+#endif // CONFIG_BOOTLOADER_APP_TEST
+        // Customer implementation.
+        // if (gpio_pin_1 == true && ...){
+        //     boot_index = required_boot_partition;
+        // } ...
     }
-
-    // Return the partition for the current boot.
     return boot_index;
 }
 
 #if CONFIG_LIBC_NEWLIB
+// Return global reent struct if any newlib functions are linked to bootloader
 struct _reent *__getreent(void)
 {
     return _GLOBAL_REENT;
